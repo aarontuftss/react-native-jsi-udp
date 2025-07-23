@@ -72,6 +72,7 @@ RCT_EXPORT_BLOCKING_SYNCHRONOUS_METHOD(install) {
 }
 
 - (void)handleAppStateChange:(NSNotification *)notification {
+  return;
   if ([notification.name
           isEqualToString:UIApplicationWillResignActiveNotification]) {
     if (_manager) {
