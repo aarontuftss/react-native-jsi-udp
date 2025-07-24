@@ -90,7 +90,7 @@ export class Socket extends EventEmitter {
     }
 
     // Schedule the next receive operation
-    this._timeoutId = setTimeout(this._receive, 0);
+    this._timeoutId = setTimeout(this._receive, 50);
   };
 
   bind(port?: number, address?: string | Callback, callback?: Callback) {
