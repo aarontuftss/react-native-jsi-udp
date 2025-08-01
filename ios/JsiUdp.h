@@ -8,8 +8,12 @@
 @interface JsiUdp : NSObject <NativeJsiUdpSpec>
 #else
 #import <React/RCTBridgeModule.h>
+#import <React/RCTEventEmitter.h>
 
-@interface JsiUdp : NSObject <RCTBridgeModule>
+@interface JsiUdp : RCTEventEmitter <RCTBridgeModule>
+{
+  BOOL _hasListeners;
+}
 #endif
 
 @end

@@ -6,6 +6,8 @@
 #include <memory>
 #include <string>
 #include <tuple>
+#include <thread>
+#include <mutex>
 
 #define MAX_PACK_SIZE 65535
 
@@ -85,6 +87,7 @@ protected:
   JSI_HOST_FUNCTION(close);
   JSI_HOST_FUNCTION(getSockName);
   JSI_HOST_FUNCTION(receive);
+  JSI_HOST_FUNCTION(stopReceive);
 
 private:
   std::map<int, int> idToFdMap;
@@ -93,5 +96,8 @@ private:
   char receiveBuffer[MAX_PACK_SIZE];
 
   std::vector<SocketState> suspendedSockets;
+  std::map<int, std::thread> receiveThreads;
+  std::map<int, bool> threadStopFlags;
+  std::mutex threadMapMutex;
 };
 } // namespace jsiudp

@@ -1,4 +1,4 @@
-import { NativeModules, Platform } from 'react-native';
+import { NativeModules, Platform, NativeEventEmitter } from 'react-native';
 import { EventEmitter } from 'tseep';
 import { Buffer } from 'buffer';
 
@@ -18,6 +18,49 @@ const JsiUdp = NativeModules.JsiUdp
         },
       }
     );
+
+// Create a NativeEventEmitter specifically for the JsiUdp module
+const udpEventEmitter = new NativeEventEmitter(JsiUdp);
+class UdpEventManager extends EventEmitter {
+  private static instance: UdpEventManager | null = null;
+  private initialized = false;
+
+  static getInstance(): UdpEventManager {
+    if (!UdpEventManager.instance) {
+      UdpEventManager.instance = new UdpEventManager();
+    }
+    return UdpEventManager.instance;
+  }
+
+  private constructor() {
+    super();
+    this.initialize();
+  }
+
+  private initialize() {
+    if (this.initialized) return;
+
+    // Single root handler for ALL UDP messages
+    udpEventEmitter.addListener('udp_message', (event) => {
+      // Emit socket-specific event internally
+      this.emit(`socket_${event.socketId}_message`, event);
+    });
+
+    this.initialized = true;
+  }
+
+  // Method to get socket-specific events
+  onSocketMessage(socketId: number, callback: (event: any) => void) {
+    this.on(`socket_${socketId}_message`, callback);
+  }
+
+  removeSocketListeners(socketId: number) {
+    this.removeAllListeners(`socket_${socketId}_message`);
+  }
+}
+
+// Global singleton instance
+const udpManager = UdpEventManager.getInstance();
 
 export interface Options {
   type: 'udp4' | 'udp6';
@@ -58,40 +101,42 @@ export class Socket extends EventEmitter {
   private startReceiving() {
     if (this._receiving || this.state !== State.BOUND) return;
 
+    udpManager.onSocketMessage(this._id, (event) => {
+      console.log('🔵 Received message for socket:', this._id, event);
+      if (event?.type === 'message') {
+        const buffer = event.data
+          ? Buffer.from(event.data, 'base64')
+          : Buffer.alloc(0);
+        this.emit('message', buffer, {
+          address: event.address,
+          port: event.port,
+          family: event.family,
+        });
+      } else if (event?.type === 'error') {
+        this.emit('error', event.error);
+      }
+    });
+    datagram_receive(this._id);
     this._receiving = true;
-    this._receive();
   }
 
   private stopReceiving() {
+    if (!this._receiving) return;
+
     this._receiving = false;
     if (this._timeoutId) {
       clearTimeout(this._timeoutId);
       this._timeoutId = null;
     }
-  }
 
-  private _receive = async () => {
-    if (!this._receiving) return;
+    // Remove event listeners first
+    udpManager.removeSocketListeners(this._id);
 
-    try {
-      const result = await datagram_receive(this._id);
-
-      if (result?.type === 'message') {
-        this.emit('message', Buffer.from(result.data!), {
-          address: result.address,
-          port: result.port,
-          family: result.family,
-        });
-      } else if (result?.type === 'error') {
-        this.emit('error', result.error);
-      }
-    } catch (e) {
-      this.emit('error', e);
+    // Stop the background receive thread
+    if (typeof datagram_stop_receive === 'function') {
+      datagram_stop_receive(this._id);
     }
-
-    // Schedule the next receive operation
-    this._timeoutId = setTimeout(this._receive, 50);
-  };
+  }
 
   bind(port?: number, address?: string | Callback, callback?: Callback) {
     if (this.state !== State.UNBOUND) {

@@ -31,6 +31,10 @@
 using namespace facebook::jsi;
 
 namespace jsiudp {
+extern "C" void emit_udp_device_event(const char* eventName, const char* eventType, 
+                                     const void* data, size_t dataLength,
+                                     const char* family, const char* address, int port,
+                                     const char* errorMsg, int socketId);
 
 std::string error_name(int err) {
   switch (err) {
@@ -166,6 +170,7 @@ UdpManager::UdpManager(Runtime *jsiRuntime) : _runtime(jsiRuntime) {
   EXPOSE_FN(*_runtime, datagram_getSockName, 2,
             BIND_METHOD(UdpManager::getSockName));
   EXPOSE_FN(*_runtime, datagram_receive, 1, BIND_METHOD(UdpManager::receive));
+  EXPOSE_FN(*_runtime, datagram_stop_receive, 1, BIND_METHOD(UdpManager::stopReceive));
 
   auto global = _runtime->global();
   global.setProperty(*_runtime, "dgc_SOL_SOCKET", static_cast<int>(SOL_SOCKET));
@@ -194,15 +199,61 @@ UdpManager::UdpManager(Runtime *jsiRuntime) : _runtime(jsiRuntime) {
 
 UdpManager::~UdpManager() {
   _invalidate = true;
+  
+  // Signal all threads to stop immediately
+  {
+    std::lock_guard<std::mutex> lock(threadMapMutex);
+    for (auto& [id, stopFlag] : threadStopFlags) {
+      stopFlag = true;
+    }
+  }
+  
+  // Close all sockets immediately to break recvfrom calls
   for (const auto &[id, fd] : idToFdMap) {
     ::close(fd);
   }
+  
+  // NO DELAY - Detach all threads immediately
+  {
+    std::lock_guard<std::mutex> lock(threadMapMutex);
+    for (auto& [id, thread] : receiveThreads) {
+      if (thread.joinable()) {
+        thread.detach(); // Immediate detach
+      }
+    }
+    receiveThreads.clear();
+    threadStopFlags.clear();
+  }
+  
+  idToFdMap.clear();
 }
 
 void UdpManager::closeAll() {
+  // Signal all threads to stop
+  {
+    std::lock_guard<std::mutex> lock(threadMapMutex);
+    for (auto& [id, stopFlag] : threadStopFlags) {
+      stopFlag = true;
+    }
+  }
+  
+  // Close sockets first to break blocking calls
   for (const auto &[id, fd] : idToFdMap) {
     ::close(fd);
   }
+  
+  // NO DELAY - Detach threads immediately
+  {
+    std::lock_guard<std::mutex> lock(threadMapMutex);
+    for (auto& [id, thread] : receiveThreads) {
+      if (thread.joinable()) {
+        thread.detach();
+      }
+    }
+    receiveThreads.clear();
+    threadStopFlags.clear();
+  }
+  
   idToFdMap.clear();
 }
 
@@ -274,9 +325,40 @@ JSI_HOST_FUNCTION(UdpManager::bind) {
 
 JSI_HOST_FUNCTION(UdpManager::close) {
   auto id = static_cast<int>(arguments[0].asNumber());
+  
+  // Check if socket exists
+  if (idToFdMap.find(id) == idToFdMap.end()) {
+    return Value::undefined();
+  }
+  
   auto fd = idToFdMap[id];
+
+  // Signal thread to stop FIRST
+  {
+    std::lock_guard<std::mutex> lock(threadMapMutex);
+    auto flagIt = threadStopFlags.find(id);
+    if (flagIt != threadStopFlags.end()) {
+      flagIt->second = true;
+    }
+  }
+  
+  // Close socket immediately to break recvfrom
   ::close(fd);
   idToFdMap.erase(id);
+  
+  // Clean up thread immediately - no waiting
+  {
+    std::lock_guard<std::mutex> lock(threadMapMutex);
+    auto threadIt = receiveThreads.find(id);
+    if (threadIt != receiveThreads.end()) {
+      if (threadIt->second.joinable()) {
+        threadIt->second.detach();
+      }
+      receiveThreads.erase(threadIt);
+    }
+    threadStopFlags.erase(id);
+  }
+  
   return Value::undefined();
 }
 
@@ -468,70 +550,130 @@ JSI_HOST_FUNCTION(UdpManager::getSockName) {
 
 JSI_HOST_FUNCTION(UdpManager::receive) {
   auto id = static_cast<int>(arguments[0].asNumber());
+  
+  // Check if socket still exists
+  if (idToFdMap.find(id) == idToFdMap.end()) {
+    throw JSError(runtime, "E_INVALID_SOCKET");
+  }
+  
   auto fd = idToFdMap[id];
 
-  // Create a Promise
-  auto promiseCtor = runtime.global().getPropertyAsFunction(runtime, "Promise");
-  auto promise = promiseCtor.callAsConstructor(
-      runtime,
-      Function::createFromHostFunction(
-          runtime, PropNameID::forAscii(runtime, "executor"), 2,
-          [fd, this](Runtime &runtime, const Value &thisValue,
-                     const Value *arguments, size_t count) -> Value {
-            struct sockaddr_in in_addr;
-            socklen_t in_len = sizeof(in_addr);
-            auto resolve = arguments[0].asObject(runtime).asFunction(runtime);
-            auto reject = arguments[1].asObject(runtime).asFunction(runtime);
+  // Start a background receive thread if not already running
+  {
+    std::lock_guard<std::mutex> lock(threadMapMutex);
+    if (threadStopFlags.find(id) == threadStopFlags.end()) {
+      // Create a new flag for this socket
+      threadStopFlags[id] = false;
+      
+      receiveThreads[id] = std::thread([this, id, fd]() {
+        LOGI("Started UDP listener thread for socket id=%d fd=%d", id, fd);
+        char buffer[MAX_PACK_SIZE];
+        struct sockaddr_in sender_addr;
+        socklen_t sender_len = sizeof(sender_addr);
+        
+        // Keep receiving until stop flag is set or socket is closed
+        while (true) {
+          // Quick check for stop conditions - no lock needed for atomic check
+          if (_invalidate) {
+            LOGI("Manager invalidated, exiting thread for socket id=%d", id);
+            break;
+          }
+          
+          // Check stop flag
+          bool shouldStop = false;
+          {
+            std::lock_guard<std::mutex> lock(threadMapMutex);
+            auto flagIt = threadStopFlags.find(id);
+            shouldStop = (flagIt != threadStopFlags.end() && flagIt->second);
+          }
+          
+          if (shouldStop) {
+            LOGI("Stop flag set for socket id=%d, exiting thread", id);
+            break;
+          }
+          
+          // This will return immediately with EBADF if socket is closed
+          auto recvn = recvfrom(fd, buffer, sizeof(buffer), 0, 
+              (struct sockaddr*)&sender_addr, &sender_len);
 
-            auto recvn = recvfrom(fd, receiveBuffer, sizeof(receiveBuffer), 0,
-                                  (struct sockaddr *)&in_addr, &in_len);
-
-            if (recvn < 0) {
-              if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                auto errorObj = Object(runtime);
-                errorObj.setProperty(runtime, "type",
-                                     String::createFromAscii(runtime, "error"));
-                errorObj.setProperty(runtime, "error",
-                                     String::createFromAscii(
-                                         runtime, error_name(errno).c_str()));
-                reject.call(runtime, std::move(errorObj));
-              } else {
-                // No data available, resolve with undefined
-                resolve.call(runtime, Value::undefined());
-              }
-            } else {
-              auto eventObj = Object(runtime);
-              eventObj.setProperty(runtime, "type",
-                                   String::createFromAscii(runtime, "message"));
-
-              auto ArrayBuffer = runtime.global().getPropertyAsFunction(
-                  runtime, "ArrayBuffer");
-              auto arrayBufferObj =
-                  ArrayBuffer
-                      .callAsConstructor(runtime, static_cast<int>(recvn))
-                      .getObject(runtime);
-              auto arrayBuffer = arrayBufferObj.getArrayBuffer(runtime);
-              memcpy(arrayBuffer.data(runtime), receiveBuffer, recvn);
-
-              eventObj.setProperty(runtime, "data", std::move(arrayBuffer));
-              eventObj.setProperty(
-                  runtime, "family",
-                  String::createFromAscii(runtime, in_addr.sin_family == AF_INET
-                                                       ? "IPv4"
-                                                       : "IPv6"));
-              eventObj.setProperty(runtime, "address",
-                                   String::createFromAscii(
-                                       runtime, inet_ntoa(in_addr.sin_addr)));
-              eventObj.setProperty(runtime, "port",
-                                   static_cast<int>(ntohs(in_addr.sin_port)));
-
-              resolve.call(runtime, std::move(eventObj));
+          if (recvn > 0) {
+            // Get address and port info
+            std::string family = sender_addr.sin_family == AF_INET ? "IPv4" : "IPv6";
+            std::string address = inet_ntoa(sender_addr.sin_addr);
+            int port = ntohs(sender_addr.sin_port);
+            
+            // Send raw data directly - no base64 encoding
+            emit_udp_device_event("udp_message", "message", 
+                                  buffer, recvn, 
+                                  family.c_str(), address.c_str(), port, 
+                                  nullptr, id);
+          } else if (recvn < 0) {
+            // Check for socket closed (immediate exit)
+            if (errno == EBADF || errno == ENOTSOCK) {
+              LOGI("Socket id=%d closed (EBADF/ENOTSOCK), exiting thread", id);
+              break;
             }
+            
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+              // Other error occurred - send error event
+              std::string errorName = error_name(errno);
+              emit_udp_device_event("udp_message", "error", 
+                                  nullptr, 0,  // No data 
+                                  "", "", 0,   // No address info
+                                  errorName.c_str(), id);
+            }
+          }
+          // Short sleep to avoid hogging CPU
+          std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        
+        LOGI("UDP listener thread for socket id=%d exiting", id);
+      });
+    }
+  }
 
-            return Value::undefined();
-          }));
+  return Value::undefined();
+}
 
-  return promise;
+JSI_HOST_FUNCTION(UdpManager::stopReceive) {
+  auto id = static_cast<int>(arguments[0].asNumber());
+  
+  // Signal thread to stop
+  {
+    std::lock_guard<std::mutex> lock(threadMapMutex);
+    auto flagIt = threadStopFlags.find(id);
+    if (flagIt != threadStopFlags.end()) {
+      flagIt->second = true;
+    }
+  }
+  
+  // Get the fd before erasing from map
+  int fd = -1;
+  auto fdIt = idToFdMap.find(id);
+  if (fdIt != idToFdMap.end()) {
+    fd = fdIt->second;
+  }
+  
+  // Close socket to break recvfrom immediately
+  if (fd != -1) {
+    ::close(fd);
+    idToFdMap.erase(id);
+  }
+  
+  // Clean up thread immediately
+  {
+    std::lock_guard<std::mutex> lock(threadMapMutex);
+    auto threadIt = receiveThreads.find(id);
+    if (threadIt != receiveThreads.end()) {
+      if (threadIt->second.joinable()) {
+        threadIt->second.detach(); // Immediate detach
+      }
+      receiveThreads.erase(threadIt);
+    }
+    threadStopFlags.erase(id);
+  }
+
+  return Value::undefined();
 }
 
 void UdpManager::suspendAll() {
